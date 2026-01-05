@@ -1,0 +1,816 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="pt-BR"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Desafio Financeiro 2026</title>
+    <meta name="description" content="Economize de R$1.000 até R$21.000 com nosso app gamificado de metas financeiras">
+    <script src="https://cdn.tailwindcss.com/"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @keyframes bounce {
+            0%, 100% { transform: translateY(-25%); animation-timing-function: cubic-bezier(0.8, 0, 1, 1); }
+            50% { transform: translateY(0); animation-timing-function: cubic-bezier(0, 0, 0.2, 1); }
+        }
+        .animate-bounce { animation: bounce 1s infinite; }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .fade-in { animation: fadeIn 0.5s ease-out; }
+    </style>
+<style>*, ::before, ::after{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgb(59 130 246 / 0.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }::backdrop{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgb(59 130 246 / 0.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }/* ! tailwindcss v3.4.17 | MIT License | https://tailwindcss.com */*,::after,::before{box-sizing:border-box;border-width:0;border-style:solid;border-color:#e5e7eb}::after,::before{--tw-content:''}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;tab-size:4;font-family:ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0;padding:0}legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.bg-gradient-to-br{background-image:linear-gradient(to bottom right, var(--tw-gradient-stops))}.from-indigo-50{--tw-gradient-from:#eef2ff var(--tw-gradient-from-position);--tw-gradient-to:rgb(238 242 255 / 0) var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from), var(--tw-gradient-to)}.via-white{--tw-gradient-to:rgb(255 255 255 / 0)  var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from), #fff var(--tw-gradient-via-position), var(--tw-gradient-to)}.to-purple-50{--tw-gradient-to:#faf5ff var(--tw-gradient-to-position)}</style></head>
+<body class="bg-gradient-to-br from-indigo-50 via-white to-purple-50" id="artifacts-component-root-html">
+    <div id="root"></div>
+
+    <script crossorigin="" src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin="" src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        const FinancialPlannerApp = () => {
+            const presetGoals = [
+                { value: 1000, label: 'R$ 1.000', color: 'from-green-400 to-green-600', days: 30 },
+                { value: 3000, label: 'R$ 3.000', color: 'from-blue-400 to-blue-600', days: 60 },
+                { value: 5000, label: 'R$ 5.000', color: 'from-purple-400 to-purple-600', days: 90 },
+                { value: 10000, label: 'R$ 10.000', color: 'from-orange-400 to-orange-600', days: 120 },
+                { value: 15000, label: 'R$ 15.000', color: 'from-pink-400 to-pink-600', days: 150 },
+                { value: 21000, label: 'R$ 21.000', color: 'from-red-400 to-red-600', days: 180 }
+            ];
+
+            const [selectedGoal, setSelectedGoal] = useState(null);
+            const [dailyProgress, setDailyProgress] = useState({});
+            const [dailyAmounts, setDailyAmounts] = useState({});
+            const [showCelebration, setShowCelebration] = useState(false);
+            const [currentStreak, setCurrentStreak] = useState(0);
+            const [showCustomGoal, setShowCustomGoal] = useState(false);
+            const [customValue, setCustomValue] = useState('');
+            const [customDays, setCustomDays] = useState('');
+            const [userName, setUserName] = useState('');
+            const [showNamePrompt, setShowNamePrompt] = useState(true);
+            const [notes, setNotes] = useState({});
+            const [showStats, setShowStats] = useState(false);
+            const [motivationalQuote, setMotivationalQuote] = useState('');
+
+            const quotes = [
+                "Pequenas ações diárias criam grandes resultados!",
+                "Você está mais perto do seu objetivo do que ontem!",
+                "Cada dia economizado é um passo em direção à liberdade financeira!",
+                "Disciplina é a ponte entre objetivos e conquistas!",
+                "Acredite em você! Você consegue!",
+                "O futuro depende do que você faz hoje!",
+                "Persistência é o caminho do êxito!",
+                "Grandes conquistas começam com pequenos passos!"
+            ];
+
+            useEffect(() => {
+                const savedName = localStorage.getItem('userName');
+                if (savedName) {
+                    setUserName(savedName);
+                    setShowNamePrompt(false);
+                }
+                const randomQuote = quotes[Math.floor(Math.random() * quotes.length)];
+                setMotivationalQuote(randomQuote);
+            }, []);
+
+            useEffect(() => {
+                if (selectedGoal) {
+                    const savedProgress = localStorage.getItem(`progress_${selectedGoal.value}_${selectedGoal.days}`);
+                    const savedAmounts = localStorage.getItem(`amounts_${selectedGoal.value}_${selectedGoal.days}`);
+                    const savedNotes = localStorage.getItem(`notes_${selectedGoal.value}_${selectedGoal.days}`);
+                    
+                    if (savedProgress) setDailyProgress(JSON.parse(savedProgress));
+                    if (savedAmounts) setDailyAmounts(JSON.parse(savedAmounts));
+                    if (savedNotes) setNotes(JSON.parse(savedNotes));
+                }
+            }, [selectedGoal]);
+
+            useEffect(() => {
+                if (selectedGoal && Object.keys(dailyProgress).length > 0) {
+                    localStorage.setItem(`progress_${selectedGoal.value}_${selectedGoal.days}`, JSON.stringify(dailyProgress));
+                    localStorage.setItem(`amounts_${selectedGoal.value}_${selectedGoal.days}`, JSON.stringify(dailyAmounts));
+                    localStorage.setItem(`notes_${selectedGoal.value}_${selectedGoal.days}`, JSON.stringify(notes));
+                    calculateStreak();
+                }
+            }, [dailyProgress, dailyAmounts, notes, selectedGoal]);
+
+            const saveName = () => {
+                if (userName.trim()) {
+                    localStorage.setItem('userName', userName);
+                    setShowNamePrompt(false);
+                }
+            };
+
+            const calculateStreak = () => {
+                const days = Object.keys(dailyProgress).sort((a, b) => parseInt(b) - parseInt(a));
+                let streak = 0;
+                for (let i = 0; i < days.length; i++) {
+                    if (dailyProgress[days[i]]) streak++;
+                    else break;
+                }
+                setCurrentStreak(streak);
+            };
+
+            const toggleDay = (day) => {
+                const newProgress = { ...dailyProgress, [day]: !dailyProgress[day] };
+                setDailyProgress(newProgress);
+                if (!dailyProgress[day]) {
+                    setShowCelebration(true);
+                    setTimeout(() => setShowCelebration(false), 2000);
+                }
+            };
+
+            const updateDailyAmount = (day, amount) => {
+                setDailyAmounts({ ...dailyAmounts, [day]: parseFloat(amount) || 0 });
+            };
+
+            const updateNote = (day, note) => {
+                setNotes({ ...notes, [day]: note });
+            };
+
+            const createCustomGoal = () => {
+                const value = parseFloat(customValue);
+                const days = parseInt(customDays);
+                if (value > 0 && days > 0 && days <= 365) {
+                    const customGoal = {
+                        value: value,
+                        label: `R$ ${value.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`,
+                        color: 'from-indigo-400 to-purple-600',
+                        days: days,
+                        isCustom: true
+                    };
+                    setSelectedGoal(customGoal);
+                    setShowCustomGoal(false);
+                }
+            };
+
+            const calculateStats = () => {
+                if (!selectedGoal) return { completed: 0, remaining: 0, saved: 0, percentage: 0, dailyAmount: 0 };
+                const completed = Object.values(dailyProgress).filter(Boolean).length;
+                const remaining = selectedGoal.days - completed;
+                const defaultDailyAmount = selectedGoal.value / selectedGoal.days;
+                const saved = Object.keys(dailyProgress).reduce((total, day) => {
+                    if (dailyProgress[day]) {
+                        return total + (dailyAmounts[day] || defaultDailyAmount);
+                    }
+                    return total;
+                }, 0);
+                const percentage = (saved / selectedGoal.value) * 100;
+                return { completed, remaining, saved, percentage, dailyAmount: defaultDailyAmount };
+            };
+
+            const stats = calculateStats();
+
+            const getBadges = () => {
+                const badges = [];
+                if (stats.completed >= 7) badges.push({ icon: '⚡', text: '7 dias seguidos!', color: 'text-yellow-500' });
+                if (stats.completed >= 14) badges.push({ icon: '🔥', text: '2 semanas!', color: 'text-orange-500' });
+                if (stats.completed >= 30) badges.push({ icon: '🏆', text: '1 mês completo!', color: 'text-orange-600' });
+                if (stats.completed >= 60) badges.push({ icon: '⭐', text: '2 meses!', color: 'text-purple-500' });
+                if (stats.percentage >= 25) badges.push({ icon: '🎯', text: '25% da meta!', color: 'text-blue-500' });
+                if (stats.percentage >= 50) badges.push({ icon: '🏅', text: '50% da meta!', color: 'text-purple-500' });
+                if (stats.percentage >= 75) badges.push({ icon: '🎁', text: '75% da meta!', color: 'text-pink-500' });
+                if (stats.percentage >= 100) badges.push({ icon: '🏆', text: 'META COMPLETA!', color: 'text-green-500' });
+                if (currentStreak >= 10) badges.push({ icon: '🔥', text: `${currentStreak} dias de sequência!`, color: 'text-red-500' });
+                return badges;
+            };
+
+            const downloadReport = () => {
+                const report = `
+RELATÓRIO FINANCEIRO - ${selectedGoal.label}
+${userName ? `Cliente: ${userName}` : ''}
+Data: ${new Date().toLocaleDateString('pt-BR')}
+
+RESUMO:
+- Meta: ${selectedGoal.label} em ${selectedGoal.days} dias
+- Economizado: R$ ${stats.saved.toFixed(2)}
+- Progresso: ${stats.percentage.toFixed(1)}%
+- Dias completos: ${stats.completed}
+- Dias restantes: ${stats.remaining}
+- Sequência atual: ${currentStreak} dias
+
+DETALHAMENTO POR DIA:
+${Object.keys(dailyProgress).filter(day => dailyProgress[day]).map(day => 
+    `Dia ${day}: R$ ${(dailyAmounts[day] || stats.dailyAmount).toFixed(2)}${notes[day] ? ` - ${notes[day]}` : ''}`
+).join('\n')}
+
+Continue firme no seu objetivo! 💪
+                `.trim();
+
+                const blob = new Blob([report], { type: 'text/plain' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `relatorio-financeiro-${new Date().getTime()}.txt`;
+                a.click();
+            };
+
+            if (showNamePrompt) {
+                return (
+                    <div className="min-h-screen flex items-center justify-center p-4">
+                        <div className="bg-white rounded-2xl shadow-2xl p-8 max-w-md w-full fade-in">
+                            <div className="text-center mb-6">
+                                <div className="inline-block p-4 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full mb-4">
+                                    <i className="fas fa-dollar-sign text-white text-4xl"></i>
+                                </div>
+                                <h1 className="text-3xl font-bold text-gray-800 mb-2">Bem-vindo(a)!</h1>
+                                <p className="text-gray-600">Como podemos te chamar?</p>
+                            </div>
+                            <input
+                                type="text"
+                                value={userName}
+                                onChange={(e) => setUserName(e.target.value)}
+                                onKeyPress={(e) => e.key === 'Enter' && saveName()}
+                                placeholder="Digite seu nome"
+                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-lg mb-4 focus:border-indigo-500 focus:outline-none"
+                                autoFocus
+                            />
+                            <button
+                                onClick={saveName}
+                                className="w-full py-3 bg-gradient-to-r from-indigo-500 to-purple-500 text-white font-semibold rounded-lg hover:opacity-90 transition-opacity"
+                            >
+                                Começar Jornada
+                            </button>
+                            <button
+                                onClick={() => setShowNamePrompt(false)}
+                                className="w-full py-2 text-gray-500 text-sm mt-2 hover:text-gray-700"
+                            >
+                                Pular
+                            </button>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (!selectedGoal) {
+                return (
+                    <div className="min-h-screen p-4">
+                        <div className="max-w-6xl mx-auto py-8">
+                            <div className="text-center mb-12 fade-in">
+                                <div className="inline-block p-4 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full mb-4">
+                                    <i className="fas fa-dollar-sign text-white text-4xl"></i>
+                                </div>
+                                <h1 className="text-4xl font-bold text-gray-800 mb-3">
+                                    {userName ? `Olá, ${userName}! 👋` : 'Desafio Financeiro 2026'}
+                                </h1>
+                                <p className="text-xl text-gray-600 mb-6">Escolha sua meta e comece a economizar hoje!</p>
+                                <button
+                                    onClick={() => setShowCustomGoal(true)}
+                                    className="px-6 py-3 bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold rounded-lg hover:opacity-90 transition-opacity"
+                                >
+                                    <i className="fas fa-edit mr-2"></i>
+                                    Criar Meta Personalizada
+                                </button>
+                            </div>
+
+                            {showCustomGoal && (
+                                <div className="bg-white rounded-2xl shadow-xl p-8 mb-8 border-2 border-indigo-200 fade-in">
+                                    <h2 className="text-2xl font-bold text-gray-800 mb-6">
+                                        <i className="fas fa-edit text-indigo-600 mr-2"></i>
+                                        Crie Sua Meta Personalizada
+                                    </h2>
+                                    <div className="grid md:grid-cols-2 gap-6 mb-6">
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Quanto quer economizar?
+                                            </label>
+                                            <div className="relative">
+                                                <span className="absolute left-4 top-3 text-gray-500">R$</span>
+                                                <input
+                                                    type="number"
+                                                    value={customValue}
+                                                    onChange={(e) => setCustomValue(e.target.value)}
+                                                    placeholder="10000"
+                                                    className="w-full pl-12 pr-4 py-3 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:outline-none"
+                                                />
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Em quantos dias? (máx. 365)
+                                            </label>
+                                            <input
+                                                type="number"
+                                                value={customDays}
+                                                onChange={(e) => setCustomDays(e.target.value)}
+                                                placeholder="120"
+                                                max="365"
+                                                className="w-full px-4 py-3 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:outline-none"
+                                            />
+                                        </div>
+                                    </div>
+
+                                    {customValue && customDays && parseFloat(customValue) > 0 && parseInt(customDays) > 0 && (
+                                        <div className="bg-indigo-50 rounded-lg p-4 mb-6">
+                                            <p className="text-gray-700">
+                                                <span className="font-semibold">Você vai economizar:</span><br/>
+                                                <span className="text-2xl font-bold text-indigo-600">
+                                                    R$ {(parseFloat(customValue) / parseInt(customDays)).toFixed(2)}
+                                                </span>
+                                                <span className="text-gray-600"> por dia</span>
+                                            </p>
+                                        </div>
+                                    )}
+
+                                    <div className="flex gap-3">
+                                        <button
+                                            onClick={createCustomGoal}
+                                            disabled={!customValue || !customDays || parseFloat(customValue) <= 0 || parseInt(customDays) <= 0 || parseInt(customDays) > 365}
+                                            className="flex-1 py-3 bg-gradient-to-r from-indigo-500 to-purple-500 text-white font-semibold rounded-lg hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
+                                        >
+                                            Criar Desafio
+                                        </button>
+                                        <button
+                                            onClick={() => setShowCustomGoal(false)}
+                                            className="px-6 py-3 bg-gray-200 text-gray-700 font-semibold rounded-lg hover:bg-gray-300 transition-colors"
+                                        >
+                                            Cancelar
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            <h3 className="text-xl font-bold text-gray-700 mb-4 text-center">Ou escolha uma meta pronta:</h3>
+
+                            <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                                {presetGoals.map((goal) => (
+                                    <div
+                                        key={goal.value}
+                                        onClick={() => setSelectedGoal(goal)}
+                                        className="bg-white rounded-2xl shadow-lg hover:shadow-2xl transition-all cursor-pointer transform hover:scale-105 overflow-hidden fade-in"
+                                    >
+                                        <div className={`h-3 bg-gradient-to-r ${goal.color}`}></div>
+                                        <div className="p-6">
+                                            <div className="text-center mb-4">
+                                                <div className={`inline-block p-3 bg-gradient-to-r ${goal.color} rounded-full mb-3`}>
+                                                    <i className="fas fa-bullseye text-white text-2xl"></i>
+                                                </div>
+                                                <h2 className="text-3xl font-bold text-gray-800 mb-2">{goal.label}</h2>
+                                                <p className="text-gray-600">em {goal.days} dias</p>
+                                            </div>
+                                            <div className="space-y-3 mb-4">
+                                                <div className="flex items-center justify-between text-sm">
+                                                    <span className="text-gray-600">Por dia:</span>
+                                                    <span className="font-semibold text-gray-800">
+                                                        R$ {(goal.value / goal.days).toFixed(2)}
+                                                    </span>
+                                                </div>
+                                                <div className="flex items-center justify-between text-sm">
+                                                    <span className="text-gray-600">Por semana:</span>
+                                                    <span className="font-semibold text-gray-800">
+                                                        R$ {((goal.value / goal.days) * 7).toFixed(2)}
+                                                    </span>
+                                                </div>
+                                            </div>
+                                            <button className={`w-full py-3 rounded-lg bg-gradient-to-r ${goal.color} text-white font-semibold hover:opacity-90 transition-opacity`}>
+                                                Começar Desafio
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            const badges = getBadges();
+
+            return (
+                <div className="min-h-screen p-4">
+                    {showCelebration && (
+                        <div className="fixed inset-0 flex items-center justify-center z-50 pointer-events-none">
+                            <div className="bg-white rounded-full p-8 shadow-2xl animate-bounce">
+                                <i className="fas fa-trophy text-yellow-500 text-6xl"></i>
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="max-w-6xl mx-auto py-8">
+                        <div className="flex justify-between items-center mb-6">
+                            <button
+                                onClick={() => setSelectedGoal(null)}
+                                className="text-indigo-600 hover:text-indigo-800 font-semibold"
+                            >
+                                ← Trocar meta
+                            </button>
+                            <div className="flex gap-2">
+                                <button
+                                    onClick={() => setShowStats(!showStats)}
+                                    className="px-4 py-2 bg-white rounded-lg shadow hover:shadow-md transition-shadow text-gray-700"
+                                >
+                                    <i className="fas fa-chart-bar mr-2"></i>
+                                    Estatísticas
+                                </button>
+                                <button
+                                    onClick={downloadReport}
+                                    className="px-4 py-2 bg-white rounded-lg shadow hover:shadow-md transition-shadow text-gray-700"
+                                >
+                                    <i className="fas fa-download mr-2"></i>
+                                    Relatório
+                                </button>
+                            </div>
+                        </div>
+
+                        <div className={`bg-gradient-to-r ${selectedGoal.color} rounded-2xl shadow-2xl p-8 text-white mb-8 fade-in`}>
+                            <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6">
+                                <div>
+                                    <h1 className="text-4xl font-bold mb-2">Meta: {selectedGoal.label}</h1>
+                                    <p className="text-white/90 text-lg">Desafio de {selectedGoal.days} dias</p>
+                                </div>
+                                <div className="mt-4 md:mt-0 text-right">
+                                    <div className="text-5xl font-bold mb-1">R$ {stats.saved.toFixed(2)}</div>
+                                    <div className="text-white/90">economizados</div>
+                                </div>
+                            </div>
+
+                            <div className="bg-white/20 rounded-full h-6 mb-4 overflow-hidden">
+                                <div
+                                    className="h-full bg-white transition-all duration-500"
+                                    style={{ width: `${Math.min(stats.percentage, 100)}%` }}
+                                ></div>
+                            </div>
+
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                <div className="bg-white/20 rounded-lg p-4">
+                                    <div className="text-3xl font-bold">{stats.completed}</div>
+                                    <div className="text-white/90 text-sm">Dias completos</div>
+                                </div>
+                                <div className="bg-white/20 rounded-lg p-4">
+                                    <div className="text-3xl font-bold">{stats.remaining}</div>
+                                    <div className="text-white/90 text-sm">Dias restantes</div>
+                                </div>
+                                <div className="bg-white/20 rounded-lg p-4">
+                                    <div className="text-3xl font-bold">{stats.percentage.toFixed(0)}%</div>
+                                    <div className="text-white/90 text-sm">Progresso</div>
+                                </div>
+                                <div className="bg-white/20 rounded-lg p-4 flex items-center gap-2">
+                                    <i className="fas fa-fire text-3xl"></i>
+                                    <div>
+                                        <div className="text-3xl font-bold">{currentStreak}</div>
+                                        <div className="text-white/90 text-sm">Sequência</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {badges.length > 0 && (
+                            <div className="bg-white rounded-2xl shadow-lg p-6 mb-8 fade-in">
+                                <h2 className="text-xl font-bold text-gray-800 mb-4">
+                                    <i className="fas fa-medal mr-2"></i>
+                                    Conquistas Desbloqueadas ({badges.length})
+                                </h2>
+                                <div className="flex flex-wrap gap-3">
+                                    {badges.map((badge, idx) => (
+                                        <div key={idx} className="flex items-center gap-2 bg-gradient-to-r from-yellow-50 to-orange-50 border-2 border-yellow-200 rounded-lg px-4 py-2">
+                                            <span className="text-2xl">{badge.icon}</span>
+                                            <span className="font-semibold text-gray-700">{badge.text}</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {showStats && (
+                            <div className="bg-white rounded-2xl shadow-lg p-6 mb-8 fade-in">
+                                <h2 className="text-xl font-bold text-gray-800 mb-4">
+                                    <i className="fas fa-chart-line mr-2"></i>
+                                    Estatísticas Detalhadas
+                                </h2>
+                                <div className="grid md:grid-cols-3 gap-6">
+                                    <div className="bg-gradient-to-br from-green-50 to-green-100 rounded-lg p-4">
+                                        <div className="text-sm text-gray-600 mb-1">Média por dia guardado</div>
+                                        <div className="text-2xl font-bold text-green-700">
+                                            R$ {stats.completed > 0 ? (stats.saved / stats.completed).toFixed(2) : '0.00'}
+                                        </div>
+                                    </div>
+                                    <div className="bg-gradient-to-br from-blue-50 to-blue-100 rounded-lg p-4">
+                                        <div className="text-sm text-gray-600 mb-1">Falta para completar</div>
+                                        <div className="text-2xl font-bold text-blue-700">
+                                            R$ {(selectedGoal.value - stats.saved).toFixed(2)}
+                                        </div>
+                                    </div>
+                                    <div className="bg-gradient-to-br from-purple-50 to-purple-100 rounded-lg p-4">
+                                        <div className="text-sm text-gray-600 mb-1">Taxa de sucesso</div>
+                                        <div className="text-2xl font-bold text-purple-700">
+                                            {((stats.completed / selectedGoal.days) * 100).toFixed(1)}%
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        <div className="bg-white rounded-2xl shadow-lg p-6 mb-8">
+                            <h2 className="text-2xl font-bold text-gray-800 mb-2">Registre suas economias diárias</h2>
+                            <p className="text-gray-600 mb-6">Sugestão: R$ {stats.dailyAmount.toFixed(2)} por dia</p>
+                            
+                            <div className="space-y-3 max-h-96 overflow-y-auto">
+                                {Array.from({ length: Math.min(selectedGoal.days, 30) }, (_, i) => i + 1).map((day) => (
+                                    <div
+                                        key={day}
+                                        className={`rounded-lg p-4 transition-all ${
+                                            dailyProgress[day]
+                                                ? `bg-gradient-to-r ${selectedGoal.color} bg-opacity-10 border-2 border-current`
+                                                : 'bg-gray-50 border-2 border-gray-200'
+                                        }`}
+                                    >
+                                        <div className="flex items-start gap-4">
+                                            <button
+                                                onClick={() => toggleDay(day)}
+                                                className={`flex-shrink-0 w-12 h-12 rounded-lg flex items-center justify-center transition-all ${
+                                                    dailyProgress[day]
+                                                        ? `bg-gradient-to-r ${selectedGoal.color} text-white`
+                                                        : 'bg-gray-200 text-gray-600 hover:bg-gray-300'
+                                                }`}
+                                            >
+                                                {dailyProgress[day] ? <i className="fas</script></body></html>
